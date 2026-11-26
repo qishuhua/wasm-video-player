@@ -26,8 +26,67 @@ WASM 核心及配套许可证、源码和重链接文件按 Emscripten 镜像版
 
 参数：?video=URL_ENCODED&autoplay=1&svg=URL_ENCODED&mode=auto
 `mode` 可取 `auto`、`native`、`software`。
-URL 必须经过 URL 编码；WASM 软解及自动回退要求跨域 MP4 允许本站的 CORS GET。原生播放可能不需要 CORS，但仍遵守浏览器安全规则。HTTPS 页面应使用 HTTPS 视频。
+通过 video 查询参数传入的 URL 必须进行外层 URL 编码；直接粘贴到输入框则不需要。WASM 软解及自动回退要求跨域 MP4 允许本站的 CORS GET，详见下方网络视频播放注意事项。
 静态 SVG 不做逐帧轨迹同步。
+
+## 网络视频播放注意事项（OSS / S3 / MinIO / CORS）
+
+**原生播放成功，不代表 WASM 软件解码一定能够读取同一个网络视频。** 原生 HTML5 Video 通常可以直接播放跨域媒体；WASM 路径通过 JavaScript `fetch()` 下载 MP4 二进制数据，必须满足浏览器 CORS（Cross-Origin Resource Sharing，跨源资源共享）规则。
+
+| 解码模式 | 网络访问方式 | 跨域要求 |
+| --- | --- | --- |
+| auto | 原生优先，失败后 fetch + WASM | 回退到 WASM 时必须满足 CORS |
+| native | HTML5 Video | 普通媒体播放通常不需要 CORS |
+| software | fetch + FFmpeg WASM | 必须允许跨域读取 |
+| 本地文件（任意模式） | File / Blob | 不涉及远程资源 CORS |
+
+### 对象存储跨域配置
+
+以阿里云 OSS 为例，在目标 Bucket 的权限管理 / 跨域设置中添加规则；S3、MinIO 等兼容对象存储也应配置相应的 CORS 规则。
+
+| 配置项 | 建议值 |
+| --- | --- |
+| Allowed Origins | `https://qishuhua.github.io` |
+| Allowed Methods | `GET`、`HEAD` |
+| Allowed Headers | `Range`（如有其他必要请求头则按需添加；也可使用 `*`） |
+| Expose Headers | `Content-Length`、`Content-Range`、`Accept-Ranges`、`ETag` |
+| Max Age | 600 秒 |
+
+Origin 只包含协议、域名和端口，不包含 `/wasm-video-player/` 路径。若部署到其他域名或本地 HTTP 服务，应允许对应的实际 Origin。建议启用 `Vary: Origin`（如果存储服务提供该选项），避免代理或 CDN 混用不同来源的响应。
+
+预签名 URL 用于资源访问授权，CORS 用于控制浏览器跨域读取，两者独立。不需要为了 CORS 将私有 Bucket 设置为公共读，也不要在前端暴露 AccessKey Secret 或永久凭据。
+
+### 视频地址及签名
+
+- 在页面 URL 输入框中直接粘贴完整的 HTTP(S) 视频地址，包括全部预签名查询参数，无需对整个地址再次编码。
+- 通过播放器的 `?video=...` 参数传入视频时，使用 `encodeURIComponent(videoUrl)` 或 `URLSearchParams` 对外层参数编码，避免内部签名参数的 `&` 被错误拆分。不要修改原始签名参数或重复编码。
+- 确认签名未过期、对象存在且有读取权限。HTTPS 播放器应使用 HTTPS 视频地址，避免混合内容限制。
+- 当前 WASM 模式完整下载视频后再解码，单文件上限 128 MiB；原生模式不受此应用限制。
+
+### Failed to fetch 排查
+
+若本地文件软解正常、网络视频原生播放正常，但强制软解出现 `Failed to fetch`，优先检查 CORS，不要直接判定为 H.265 解码失败。
+
+1. 用同一个有效视频 URL 分别测试 `native` 和 `software`。
+2. 打开浏览器 F12 → Console / Network，查看是否有 CORS、Mixed Content、DNS、网络连接或 HTTP 错误。
+3. 检查 OSS GET 响应（包括实际重定向或 CDN 响应）是否返回匹配的 `Access-Control-Allow-Origin`。例如：
+
+   ```bash
+   curl -sS -D - -o /dev/null \
+     -H 'Origin: https://qishuhua.github.io' \
+     '完整的有效视频预签名URL'
+   ```
+
+   正常授权响应通常为 HTTP 200（Range 请求可能为 206），且应包含 `Access-Control-Allow-Origin: https://qishuhua.github.io`，或适用于不携带跨域凭据请求的 `*`。curl 不执行浏览器 CORS 检查，因此仅下载成功并不能证明浏览器可以读取。
+4. 如果原生和 WASM 都失败，也检查签名有效期、对象路径和存储访问权限；HTTP 403/404 等错误响应缺少 CORS 头时，浏览器也可能只显示 `Failed to fetch`。
+
+### 无法修改对象存储 CORS 时
+
+- 通过受控 Nginx / 后端媒体代理提供同源访问或正确的 CORS 响应头；代理应限制目标地址及访问权限。
+- 下载视频到本地，再通过播放器的文件选择器播放。
+- 不可通过 `fetch(url, {mode: "no-cors"})` 绕过限制：其 opaque 响应无法向 JavaScript 提供视频二进制数据，WASM 也就无法解码。
+
+仅修改 OSS CORS 规则不需要重新编译 WASM 或重新部署播放器。
 
 ## 本地构建
 
