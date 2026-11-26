@@ -16,11 +16,11 @@
 ## GitHub Pages
 
 在仓库 Settings → Pages → Build and deployment → Source 选择 GitHub Actions。
-然后在 Actions → Build WASM player → Run workflow，勾选 deploy。
-工作流编译 WASM，并将静态播放器部署到 GitHub Pages 站点根目录。
+此后 main 分支的 web/**、native/**、build.sh 或工作流变更会自动构建并部署，无需手动 Run workflow。
+WASM 核心及配套许可证、源码和重链接文件按 Emscripten 镜像版本、运行平台、build.sh 和 native/** 的内容哈希缓存；缓存未命中才编译 FFmpeg。每次构建始终重新复制当前 web/ 文件，避免发布旧页面。并发运行时取消过时任务。
 预计播放器 URL： https://qishuhua.github.io/wasm-video-player/
 
-不勾选 deploy 时仅构建并上传 wasm-player-site artifact，方便先测试。
+也可在 Actions → Build WASM player → Run workflow 手动执行（deploy 默认勾选）；取消勾选则仅构建并上传 wasm-player-site artifact，方便测试。仅 README 变更不触发工作流。
 可以解压该 artifact，用任意静态 HTTP 服务托管解压后的目录。
 不要双击 file:// 页面，Worker/WASM 需要 HTTP(S)。
 
