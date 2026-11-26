@@ -2,6 +2,9 @@ import {makeRenderer} from "./renderer.js";
 const $=id=>document.getElementById(id);
 const canvas=$("canvas"),panel=$("panel"),seek=$("seek"),play=$("play"),status=$("status");
 const LIMIT=128*1024*1024, HIGH=8, LOW=3;
+const modeSelect=$("decodeMode");
+let activeEngine="none", selectedSource=null, native=null, objectURL=null, startupTimer=null,
+    nativeIntent=false, fallbackReason="", resumeAt=0;
 let renderer, worker, abort, loadId=0, generation=0, queue=[], inflight=false, ready=false,
     eof=false, playing=false, seeking=false, duration=0, current=0, rate=1, anchor=0,
     running=false, preview=false, dragging=false, lastFrame=null, framesShown=0, framesDropped=0;
@@ -18,6 +21,8 @@ function controls(){
 function haltClock(){running=false;}
 function startClock(){anchor=now()-current/rate;running=true;}
 function error(e){
+  stopNative();
+  activeEngine="none";
   playing=false;ready=false;seeking=false;inflight=false;haltClock();queue=[];
   if(worker){worker.terminate();worker=null;}
   message(String(e.message||e),true);controls();
@@ -31,13 +36,15 @@ function pull(force=false){
 function show(f){
   renderer.draw(f);current=f.pts;lastFrame=f;framesShown++;
   $("info").textContent=f.width+" × "+f.height+" | FFmpeg WASM CPU | "+renderer.name+
-     " | 缓冲 "+queue.length+" 帧 | 已显示 "+framesShown+" | 跳过 "+framesDropped;
+     " | 缓冲 "+queue.length+" 帧 | 已显示 "+framesShown+" | 跳过 "+framesDropped+
+     (fallbackReason?" | 原生回退："+fallbackReason:"");
 }
 function handle(data){
   if(data.generation!==generation)return;
   if(data.type==="error"){error(data.message);return;}
   if(data.type==="opened"){
     ready=true;duration=Math.max(0,Number(data.duration)||0);preview=true;
+    if(resumeAt>0&&duration>0){const t=resumeAt;resumeAt=0;jump(t);return;}
     message("视频已打开，正在解码首帧…");controls();pull(true);
   }else if(data.type==="seeked"){
     seeking=false;preview=true;pull(true);
@@ -71,18 +78,101 @@ async function readURL(url,signal){
   const out=new Uint8Array(total);let pos=0;
   for(const c of chunks){out.set(c,pos);pos+=c.length;}return out.buffer;
 }
-async function load(source,auto=false){
+function stopNative(){
+  clearTimeout(startupTimer);startupTimer=null;
+  const v=native;native=null;
+  if(v){v.pause();v.removeAttribute("src");v.load();v.remove();}
+  if(objectURL){URL.revokeObjectURL(objectURL);objectURL=null;}
+  canvas.hidden=false;
+}
+function syncNative(){
+  const v=native;if(!v)return;
+  current=Number.isFinite(v.currentTime)?v.currentTime:0;
+  duration=Number.isFinite(v.duration)?v.duration:0;
+  playing=!v.paused&&!v.ended;
+  controls();
+  const quality=typeof v.getVideoPlaybackQuality==="function"?v.getVideoPlaybackQuality():null;
+  $("info").textContent=(v.videoWidth?v.videoWidth+" × "+v.videoHeight+" | ":"")+
+    "浏览器原生解码（硬件/软件由浏览器决定）"+
+    (quality?" | 视频帧 "+quality.totalVideoFrames+" | 丢帧 "+quality.droppedVideoFrames:"");
+}
+function failNative(reason,id,v){
+  if(id!==loadId||v!==native)return;
+  const position=Number.isFinite(v.currentTime)&&v.currentTime>0?v.currentTime:resumeAt;
+  if(modeSelect.value==="auto"){
+    load(selectedSource,nativeIntent,position,"software",reason);
+  }else error("原生播放失败："+reason+"；可选择 CPU 软解重试。");
+}
+async function nativePlay(v,id){
+  nativeIntent=true;
+  try{await v.play();}
+  catch(e){
+    if(id!==loadId||native!==v)return;
+    if(e.name==="NotSupportedError"){failNative(e.message||"不支持该视频",id,v);return;}
+    if(e.name==="AbortError")return;
+    nativeIntent=false;syncNative();
+    message(e.name==="NotAllowedError"?"浏览器阻止自动播放，请点击播放":"播放失败："+e.message,e.name!=="NotAllowedError");
+  }
+}
+function startNative(source,auto,id){
+  activeEngine="native";nativeIntent=auto;
+  const v=document.createElement("video");native=v;
+  v.id="nativeVideo";v.muted=true;v.playsInline=true;v.preload="auto";
+  v.setAttribute("playsinline","");v.setAttribute("webkit-playsinline","");
+  v.disablePictureInPicture=true;
+  v.playbackRate=rate;
+  canvas.hidden=true;canvas.parentNode.insertBefore(v,canvas);
+  const listen=(name,fn)=>v.addEventListener(name,()=>{if(id===loadId&&native===v)fn();});
+  listen("loadedmetadata",()=>{
+    ready=true;syncNative();
+    if(resumeAt>0){
+      try{v.currentTime=Math.min(resumeAt,Math.max(0,duration-0.05));}catch(_){}
+      resumeAt=0;
+    }
+    v.playbackRate=rate;controls();
+    if(nativeIntent)nativePlay(v,id);else message("原生视频已就绪");
+  });
+  function firstFrame(){clearTimeout(startupTimer);startupTimer=null;syncNative();}
+  listen("loadeddata",firstFrame);listen("canplay",firstFrame);
+  listen("playing",()=>{firstFrame();message("原生播放中");});
+  listen("play",syncNative);
+  listen("pause",()=>{syncNative();if(!v.ended&&!v.error)message("已暂停");});
+  listen("timeupdate",syncNative);listen("durationchange",syncNative);
+  listen("seeked",()=>{syncNative();if(v.paused)message("已暂停");});
+  listen("waiting",()=>{if(nativeIntent)message("原生视频缓冲中…");});
+  listen("ended",()=>{nativeIntent=false;syncNative();message("播放结束");});
+  listen("error",()=>{
+    const e=v.error;
+    failNative(e?(e.message||"MediaError "+e.code):"原生媒体加载失败",id,v);
+  });
+  v.onclick=toggle;
+  message("正在尝试浏览器原生解码…");
+  startupTimer=setTimeout(()=>failNative("20 秒内未获得首帧",id,v),20000);
+  if(source instanceof File){objectURL=URL.createObjectURL(source);v.src=objectURL;}
+  else v.src=source;
+  v.load();
+}
+async function load(source,auto=false,position=0,override="",reason=""){
   const id=++loadId;generation++;if(abort)abort.abort();abort=new AbortController();
-  if(worker)worker.terminate();worker=null;
-  queue=[];inflight=ready=eof=seeking=preview=false;playing=auto;haltClock();
+  if(worker)worker.terminate();worker=null;stopNative();
+  selectedSource=source;fallbackReason=reason;resumeAt=position;activeEngine="none";
+  queue=[];inflight=ready=eof=seeking=preview=false;playing=auto;dragging=false;haltClock();
   current=duration=framesShown=framesDropped=0;lastFrame=null;controls();$("info").textContent="";
   try{
+    if(!(source instanceof File)){
+      const url=new URL(source,location.href);
+      if(!["http:","https:"].includes(url.protocol))throw new Error("只接受 HTTP/HTTPS URL");
+      source=url.href;selectedSource=source;
+    }
+    const mode=override||modeSelect.value;
+    if(mode!=="software"){startNative(source,auto,id);return;}
+    activeEngine="software";
     if(!window.WebAssembly)throw new Error("浏览器不支持 WebAssembly");
     if(!renderer)renderer=makeRenderer(canvas);
-    message("正在读取视频…");
+    message((reason?"原生播放失败，切换 CPU 软解："+reason+"；":"")+"正在读取视频…");
     let buffer;
     if(source instanceof File){
-      if(source.size>LIMIT)throw new Error("视频超过 128 MiB");
+      if(source.size>LIMIT)throw new Error("CPU 软解模式视频超过 128 MiB");
       buffer=await source.arrayBuffer();
     }else buffer=await readURL(source,abort.signal);
     if(id!==loadId)return;
@@ -91,9 +181,10 @@ async function load(source,auto=false){
     worker.onmessage=e=>{if(id===loadId)handle(e.data);};
     worker.onerror=e=>{if(id===loadId)error(e.message||"WASM 加载失败");};
     worker.postMessage({type:"open",generation,buffer},[buffer]);
-  }catch(e){if(id===loadId&&e.name!=="AbortError")error(e);}
+  }catch(e){if(id===loadId&&e.name!=="AbortError")error((reason?"原生失败："+reason+"；CPU 软解失败：":"")+String(e.message||e));}
 }
 function jump(t){
+  if(activeEngine==="native"&&native&&ready&&duration){native.currentTime=Math.max(0,Math.min(t,duration));syncNative();return;}
   if(!ready||!worker||!duration)return;
   t=Math.max(0,Math.min(t,Math.max(0,duration-0.05)));
   generation++;queue=[];inflight=false;eof=false;seeking=true;preview=true;
@@ -102,13 +193,19 @@ function jump(t){
 }
 function toggle(){
   if(!ready)return;
+  if(activeEngine==="native"&&native){
+    if(native.paused||native.ended)nativePlay(native,loadId);
+    else{nativeIntent=false;native.pause();}
+    return;
+  }
   if(eof&&!queue.length&&!playing){playing=true;jump(0);return;}
   playing=!playing;haltClock();controls();
   if(playing){message("播放中");pull(true);}else message("已暂停");
 }
 function tick(){
   requestAnimationFrame(tick);
-  if(!playing||!ready||seeking||preview)return;
+  if(activeEngine==="native"){if(native&&ready&&playing)syncNative();return;}
+  if(activeEngine!=="software"||!playing||!ready||seeking||preview)return;
   if(!queue.length){
     haltClock();
     if(eof){playing=false;message("播放结束");controls();}
@@ -128,7 +225,14 @@ $("file").onchange=e=>{if(e.target.files[0])load(e.target.files[0],true);};
 play.onclick=toggle;
 seek.oninput=()=>{dragging=true;controls();};
 seek.onchange=()=>{const t=Number(seek.value);dragging=false;jump(t);};
-$("speed").onchange=e=>{rate=Number(e.target.value);haltClock();};
+$("speed").onchange=e=>{rate=Number(e.target.value);if(native)native.playbackRate=rate;haltClock();};
+modeSelect.onchange=()=>{
+  if(selectedSource!==null){
+    const auto=activeEngine==="native"?nativeIntent:playing;
+    const t=activeEngine==="native"&&native?native.currentTime:current;
+    load(selectedSource,auto,Number.isFinite(t)?t:0);
+  }
+};
 $("full").onclick=async()=>{
   if(document.fullscreenElement){await document.exitFullscreen();return;}
   if(panel.classList.contains("full")){panel.classList.remove("full");return;}
@@ -138,6 +242,8 @@ $("full").onclick=async()=>{
 document.addEventListener("keydown",e=>{if(e.key==="Escape")panel.classList.remove("full");});
 canvas.onclick=toggle;
 const q=new URLSearchParams(location.search);
+const requestedMode=(q.get("mode")||"auto").toLowerCase();
+modeSelect.value=["auto","native","software"].includes(requestedMode)?requestedMode:"auto";
 const svg=q.get("svg")||q.get("overlay");
 if(svg){try{const u=new URL(svg,location.href);if(["https:","http:"].includes(u.protocol)){$("overlay").src=u.href;$("overlay").hidden=false;}}catch(_){}}
 if(q.get("video")){$("url").value=q.get("video");load(q.get("video"),q.get("autoplay")==="1");}
