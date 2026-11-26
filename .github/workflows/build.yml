@@ -2,28 +2,65 @@ name: Build WASM player
 on:
   push:
     branches: [main]
+    paths:
+      - 'web/**'
+      - 'native/**'
+      - 'build.sh'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
       deploy:
-        description: Deploy to GitHub Pages (enable Pages GitHub Actions source first)
+        description: Deploy to GitHub Pages (uncheck for build-only)
         required: false
         type: boolean
-        default: false
+        default: true
+
 permissions:
   contents: read
+
+concurrency:
+  group: wasm-video-player-pages
+  cancel-in-progress: true
+
+env:
+  EMSDK_IMAGE: emscripten/emsdk:3.1.64
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build FFmpeg WASM
+      - name: Restore WASM decoder cache
+        id: wasm-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/wasm-core
+          key: wasm-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSDK_IMAGE }}-${{ hashFiles('build.sh', 'native/**') }}
+      - name: Build FFmpeg WASM on cache miss
+        if: steps.wasm-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/wasm-build" "$RUNNER_TEMP/wasm-core"
+          docker run --rm -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/wasm-build:/out" \
+            -w /src "$EMSDK_IMAGE" bash build.sh /out
+          # Cache only compiled decoder and matching LGPL/relink files.
+          # Never cache HTML, player.js, renderer.js or decoder.worker.js.
+          cp -a "$RUNNER_TEMP/wasm-build/decoder.js" \
+                "$RUNNER_TEMP/wasm-build/decoder.wasm" \
+                "$RUNNER_TEMP/wasm-build/FFmpeg-LGPL-2.1.txt" \
+                "$RUNNER_TEMP/wasm-build/ffmpeg-revision.txt" \
+                "$RUNNER_TEMP/wasm-build/relink" \
+                "$RUNNER_TEMP/wasm-core/"
+      - name: Assemble latest static site
         run: |
           mkdir -p "$RUNNER_TEMP/site"
-          docker run --rm -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/site:/site" \
-            -w /src emscripten/emsdk:3.1.64 bash build.sh /site
+          cp -a "$RUNNER_TEMP/wasm-core/." "$RUNNER_TEMP/site/"
+          cp -a web/. "$RUNNER_TEMP/site/"
+          touch "$RUNNER_TEMP/site/.nojekyll"
       - name: Verify output and JS syntax
         run: |
-          test -s "$RUNNER_TEMP/site/decoder.wasm"
+          for f in decoder.wasm decoder.js FFmpeg-LGPL-2.1.txt ffmpeg-revision.txt index.html player.js renderer.js decoder.worker.js relink/ffmpeg-source.tar.gz relink/decoder.o; do
+            test -s "$RUNNER_TEMP/site/$f"
+          done
           for f in player renderer; do
             node --input-type=module --check < "$RUNNER_TEMP/site/$f.js"
           done
@@ -34,11 +71,11 @@ jobs:
           path: ${{ runner.temp }}/site
           include-hidden-files: true
       - uses: actions/upload-pages-artifact@v3
-        if: github.event_name == 'workflow_dispatch' && inputs.deploy
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy)
         with:
           path: ${{ runner.temp }}/site
   deploy:
-    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy)
     needs: build
     runs-on: ubuntu-latest
     permissions:
